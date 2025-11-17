@@ -1,0 +1,287 @@
+import xml.etree.ElementTree as ET
+import pandas as pd
+import re
+import nltk
+from bs4 import BeautifulSoup
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import LinearSVC
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Set up matplotlib for display
+plt.rcParams['figure.figsize'] = [10, 6]
+plt.rcParams['figure.dpi'] = 100
+
+# Download stopwords
+print("Downloading NLTK stopwords...")
+nltk.download('stopwords')
+
+print("Loading and processing data...")
+
+# Load article texts - CORRECTED VERSION
+tree = ET.parse('articles-training-byarticle-20181122.xml')
+root_articles = tree.getroot()
+articles = []
+
+for article in root_articles.findall('article'):
+    article_id = article.attrib.get('id')
+    
+    # Combine all <p> elements to get the full text
+    paragraphs = []
+    for p_element in article.findall('p'):
+        if p_element.text:  # Only add if there's actual text
+            paragraphs.append(p_element.text)
+    
+    # Join all paragraphs with spaces
+    full_text = ' '.join(paragraphs)
+    
+    articles.append({'id': article_id, 'text': full_text})
+
+df_text = pd.DataFrame(articles)
+
+# Load labels
+labels_data = []
+tree_labels = ET.parse('ground-truth-training-byarticle-20181122.xml')
+root_labels = tree_labels.getroot()
+
+for article in root_labels.findall('article'):
+    article_id = article.attrib.get('id')
+    label = article.attrib.get('hyperpartisan', None)
+    labels_data.append({'id': article_id, 'label': label})
+
+df_labels = pd.DataFrame(labels_data)
+
+# Merge data
+df = pd.merge(df_text, df_labels, on='id', how='inner')
+
+print(f"Loaded {len(df)} articles with text content")
+print(f"Sample text length: {len(df.iloc[0]['text']) if len(df) > 0 else 0} characters")
+
+# Text preprocessing
+from nltk.corpus import stopwords
+stop_words = set(stopwords.words('english'))
+
+def preprocess_text(text):
+    if pd.isna(text) or text == "":
+        return ""
+    
+    # Remove HTML if any
+    soup = BeautifulSoup(text, "html.parser")
+    clean_text = soup.get_text()
+    
+    # Keep letters and spaces
+    clean_text = re.sub(r'[^A-Za-z\s]', ' ', clean_text)
+    
+    # Convert to lowercase
+    clean_text = clean_text.lower()
+    
+    # Remove stopwords and short words
+    words = clean_text.split()
+    words = [w for w in words if w not in stop_words and len(w) > 2]
+    
+    return ' '.join(words)
+
+df['clean_text'] = df['text'].apply(preprocess_text)
+
+# Remove empty texts
+df = df[df['clean_text'].str.len() > 0]
+
+print(f"After cleaning: {len(df)} articles")
+print("\nFirst few rows:")
+print(df[['id', 'text', 'clean_text', 'label']].head())
+
+# Calculate baselines
+if len(df) == 0:
+    print("WARNING: Dataframe is empty after cleaning.")
+    exit()
+
+random_preds = np.random.choice(df['label'].unique(), size=len(df))
+print('Random baseline accuracy:', accuracy_score(df['label'], random_preds))
+
+majority_class = df['label'].mode()[0]
+majority_preds = [majority_class] * len(df)
+print('Majority baseline accuracy:', accuracy_score(df['label'], majority_preds))
+
+# Feature Engineering with TF-IDF
+print("\nCreating TF-IDF features...")
+vectorizer = TfidfVectorizer(max_features=5000, stop_words='english')
+X = vectorizer.fit_transform(df['clean_text'])
+y = df['label']
+
+# Train-test split
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+
+print(f"Training set size: {X_train.shape[0]}")
+print(f"Test set size: {X_test.shape[0]}")
+
+# Model Training and Evaluation
+print("\nTraining models...")
+models = {
+    'Logistic Regression': LogisticRegression(max_iter=1000, random_state=42),
+    'SVM': LinearSVC(random_state=42),
+    'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42),
+    'Naive Bayes': MultinomialNB()
+}
+
+results = []
+
+for name, model in models.items():
+    print(f"\n=== {name} ===")
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    
+    # Calculate metrics
+    accuracy = accuracy_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred, pos_label='true', zero_division=0)
+    recall = recall_score(y_test, y_pred, pos_label='true', zero_division=0)
+    f1 = f1_score(y_test, y_pred, pos_label='true', zero_division=0)
+    
+    results.append({
+        'Model': name,
+        'Accuracy': accuracy,
+        'Precision': precision,
+        'Recall': recall,
+        'F1-score': f1
+    })
+    
+    print(classification_report(y_test, y_pred))
+    print(f"Accuracy: {accuracy:.4f}")
+
+# Create results DataFrame
+df_results = pd.DataFrame(results)
+print("\n" + "="*50)
+print("MODEL COMPARISON")
+print("="*50)
+print(df_results.round(4))
+
+# Hyperparameter tuning for Logistic Regression
+print("\nPerforming hyperparameter tuning for Logistic Regression...")
+param_grid = {
+    'C': [0.01, 0.1, 1, 10],
+    'penalty': ['l1', 'l2'],
+    'solver': ['liblinear']
+}
+
+grid = GridSearchCV(
+    LogisticRegression(max_iter=1000, random_state=42),
+    param_grid,
+    cv=5, 
+    scoring='f1_macro',
+    n_jobs=-1  
+)
+grid.fit(X_train, y_train)
+print("Best parameters:", grid.best_params_)
+print("Best cross-validated score:", grid.best_score_)
+
+best_model = grid.best_estimator_
+y_pred_tuned = best_model.predict(X_test)
+print("\nTuned Logistic Regression Performance:")
+print(classification_report(y_test, y_pred_tuned))
+
+# Visualizations
+print("\nCreating visualizations...")
+
+plt.figure(figsize=(15, 10))
+
+# Visualization 1: Model Comparison
+plt.subplot(2, 3, 1)
+df_melt = df_results.melt(id_vars='Model', var_name='Metric', value_name='Score')
+sns.barplot(x='Model', y='Score', hue='Metric', data=df_melt)
+plt.title('Model Performance Comparison')
+plt.xticks(rotation=45)
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+
+# Visualization 2: Confusion Matrix for Best Model
+best_model_name = df_results.loc[df_results['F1-score'].idxmax(), 'Model']
+best_model_instance = models[best_model_name]
+y_pred_best = best_model_instance.predict(X_test)
+
+plt.subplot(2, 3, 2)
+cm = confusion_matrix(y_test, y_pred_best)
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+            xticklabels=['not hyperpartisan','hyperpartisan'], 
+            yticklabels=['not hyperpartisan','hyperpartisan'])
+plt.xlabel('Predicted')
+plt.ylabel('Actual')
+plt.title(f'Confusion Matrix - {best_model_name}')
+
+# Visualization 3: Feature Importance (for Logistic Regression)
+if hasattr(best_model_instance, 'coef_'):
+    plt.subplot(2, 3, 3)
+    feature_names = vectorizer.get_feature_names_out()
+    coef = best_model_instance.coef_[0]
+    top_indices = np.argsort(np.abs(coef))[-20:]
+    top_features = [feature_names[i] for i in top_indices]
+    top_coef = coef[top_indices]
+    
+    colors = ['red' if x < 0 else 'blue' for x in top_coef]
+    plt.barh(range(len(top_features)), top_coef, color=colors)
+    plt.yticks(range(len(top_features)), top_features)
+    plt.title(f'Top Features - {best_model_name}')
+    plt.xlabel('Coefficient Value')
+
+# Visualization 4: Class Distribution
+plt.subplot(2, 3, 4)
+class_dist = df['label'].value_counts()
+plt.pie(class_dist.values, labels=class_dist.index, autopct='%1.1f%%', startangle=90)
+plt.title('Class Distribution in Dataset')
+
+# Visualization 5: Performance Metrics Comparison
+plt.subplot(2, 3, 5)
+metrics = ['Accuracy', 'Precision', 'Recall', 'F1-score']
+x_pos = np.arange(len(metrics))
+width = 0.2
+
+for i, model in enumerate(df_results['Model']):
+    model_metrics = df_results[df_results['Model'] == model].iloc[0]
+    values = [model_metrics['Accuracy'], model_metrics['Precision'], 
+              model_metrics['Recall'], model_metrics['F1-score']]
+    plt.bar(x_pos + i*width, values, width, label=model)
+
+plt.xlabel('Metrics')
+plt.ylabel('Score')
+plt.title('Performance Metrics by Model')
+plt.xticks(x_pos + width*1.5, metrics)
+plt.legend()
+plt.ylim(0, 1)
+
+# Visualization 6: Text Length Distribution by Class
+plt.subplot(2, 3, 6)
+df['text_length'] = df['clean_text'].str.len()
+sns.boxplot(data=df, x='label', y='text_length')
+plt.title('Text Length Distribution by Class')
+plt.ylabel('Text Length (characters)')
+
+plt.tight_layout()
+plt.show()
+
+# Print detailed analysis
+print(f"\nBest Model: {best_model_name}")
+print(f"Best F1-score: {df_results['F1-score'].max():.4f}")
+
+# Misclassified examples analysis
+misclassified = (y_pred_best != y_test)
+misclassified_indices = y_test[misclassified].index
+if len(misclassified_indices) > 0:
+    print(f"\nFirst 3 misclassified examples:")
+    misclassified_df = df.loc[misclassified_indices].head(3)
+    for idx, row in misclassified_df.iterrows():
+        actual_pred = y_pred_best[y_test.index.get_loc(idx)]
+        print(f"\nTrue label: {row['label']}, Predicted: {actual_pred}")
+        print(f"Text preview: {row['clean_text'][:200]}...")
+
+# Final summary
+print("\n" + "="*60)
+print("EXPERIMENT SUMMARY")
+print("="*60)
+print(f"Dataset: {len(df)} articles")
+print(f"Classes: {df['label'].value_counts().to_dict()}")
+print(f"Best performing model: {best_model_name}")
+print(f"Best F1-score: {df_results['F1-score'].max():.4f}")
+print("="*60)
